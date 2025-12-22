@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,17 +14,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"gopkg.in/yaml.v3"
 )
 
 //
-// ===================== CONFIG =====================
+// ================= CONFIG =================
 //
 
 type Config struct {
 	Server *ServerConfig        `yaml:"server,omitempty"`
-	AI     *AIConfig            `yaml:"ai,omitempty"`
 	Apps   map[string]AppConfig `yaml:"apps"`
 }
 
@@ -33,52 +34,81 @@ type ServerConfig struct {
 	MaxLines     int    `yaml:"max_lines,omitempty"`
 }
 
-type AIConfig struct {
-	BaseURL        string `yaml:"base_url"`
-	APIKey         string `yaml:"api_key,omitempty"`
-	TimeoutSeconds int    `yaml:"timeout_seconds,omitempty"`
-}
-
 type AppConfig struct {
 	Logs map[string]LogTarget `yaml:"logs"`
 }
 
 type LogTarget struct {
-	Type string `yaml:"type"`
-	Path string `yaml:"path,omitempty"`
-	URL  string `yaml:"url,omitempty"`
+	Type    string `yaml:"type"`
+	Path    string `yaml:"path,omitempty"`
+	URL     string `yaml:"url,omitempty"`
+	Service string `yaml:"service"`
 }
 
-var (
-	globalConfig *Config
-)
+var globalConfig *Config
 
-func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
-	}
+//
+// ================= STREAM MANAGER =================
+//
 
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
+var streamMgr = NewStreamManager(DefaultStreamConfig())
 
-	if cfg.Server == nil {
-		cfg.Server = &ServerConfig{}
-	}
-	if cfg.Server.DefaultLines <= 0 {
-		cfg.Server.DefaultLines = 100
-	}
-	if cfg.Server.MaxLines <= 0 {
-		cfg.Server.MaxLines = 1000
-	}
+//
+// ================= STREAM STATUS =================
+//
 
-	return &cfg, nil
+type StreamStatus struct {
+	Active    bool      `json:"active"`
+	AppName   string    `json:"app_name,omitempty"`
+	LogType   string    `json:"log_type,omitempty"`
+	Path      string    `json:"path,omitempty"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+}
+
+var currentStream = &StreamStatus{}
+
+//
+// ================= OUTPUT SCHEMA =================
+//
+
+type LogOutput struct {
+	Timestamp string `json:"timestamp"`
+	Level     string `json:"level"`
+	Service   string `json:"service"`
+	Message   string `json:"message"`
 }
 
 //
-// ===================== LOG SOURCES =====================
+// ================= UTF-16 FILE READER =================
+//
+
+func readFileAutoUTF(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	if len(data) > 2 && data[0] == 0xFF && data[1] == 0xFE {
+		u16 := make([]uint16, (len(data)-2)/2)
+		for i := range u16 {
+			u16[i] = binary.LittleEndian.Uint16(data[2+i*2:])
+		}
+		return string(utf16.Decode(u16)), nil
+	}
+
+	if len(data) > 2 && data[0] == 0xFE && data[1] == 0xFF {
+		u16 := make([]uint16, (len(data)-2)/2)
+		for i := range u16 {
+			u16[i] = binary.BigEndian.Uint16(data[2+i*2:])
+		}
+		return string(utf16.Decode(u16)), nil
+	}
+
+	return string(data), nil
+}
+
+//
+// ================= LOG SOURCES =================
 //
 
 type LogSource interface {
@@ -90,389 +120,347 @@ type FileLogSource struct {
 }
 
 func (f *FileLogSource) ReadLogs(ctx context.Context, lines int) (string, error) {
-	file, err := os.Open(f.Path)
+	content, err := readFileAutoUTF(f.Path)
 	if err != nil {
-		return "", fmt.Errorf("open file: %w", err)
-	}
-	defer file.Close()
-
-	var allLines []string
-	scanner := bufio.NewScanner(file)
-
-	// Read all lines
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		default:
-		}
-		allLines = append(allLines, scanner.Text())
+		return "", err
 	}
 
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("scan file: %w", err)
+	var all []string
+	sc := bufio.NewScanner(strings.NewReader(content))
+	for sc.Scan() {
+		all = append(all, sc.Text())
 	}
 
-	// If file is empty:
-	if len(allLines) == 0 {
+	if len(all) == 0 {
 		return "", nil
 	}
 
-	// Determine how many lines to return
-	if lines <= 0 || lines > len(allLines) {
-		lines = len(allLines)
+	if lines <= 0 || lines > len(all) {
+		lines = len(all)
 	}
 
-	// START from bottom
-	start := len(allLines) - lines
-	selected := allLines[start:]
-
-	// Join
-	result := strings.Join(selected, "\n") + "\n"
-	return result, nil
+	start := len(all) - lines
+	return strings.Join(all[start:], "\n"), nil
 }
 
 type APILogSource struct {
-	URL    string
-	Client *http.Client
+	URL string
 }
 
 func (a *APILogSource) ReadLogs(ctx context.Context, lines int) (string, error) {
-	if a.Client == nil {
-		a.Client = &http.Client{
-			Timeout: 10 * time.Second,
-		}
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := a.Client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("do request: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("remote API error: %s", resp.Status)
-	}
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read body: %w", err)
-	}
-
-	return string(bodyBytes), nil
+	b, _ := io.ReadAll(resp.Body)
+	return string(b), nil
 }
 
 //
-// ===================== HELPERS =====================
+// ================= HELPERS =================
 //
 
 func parseLines(r *http.Request) int {
-	linesStr := r.URL.Query().Get("lines")
-	if linesStr == "" {
-		if globalConfig != nil && globalConfig.Server != nil {
-			return globalConfig.Server.DefaultLines
-		}
-		return 100
-	}
-	n, err := strconv.Atoi(linesStr)
+	n, err := strconv.Atoi(r.URL.Query().Get("lines"))
 	if err != nil || n <= 0 {
-		if globalConfig != nil && globalConfig.Server != nil {
-			return globalConfig.Server.DefaultLines
-		}
-		return 100
+		return globalConfig.Server.DefaultLines
 	}
-	if globalConfig != nil && globalConfig.Server != nil && n > globalConfig.Server.MaxLines {
+	if n > globalConfig.Server.MaxLines {
 		n = globalConfig.Server.MaxLines
 	}
 	return n
 }
 
-func selectSourceFromQuery(r *http.Request) (LogSource, error) {
-	source := r.URL.Query().Get("source")
-	switch source {
-	case "file":
-		path := r.URL.Query().Get("path")
-		if path == "" {
-			return nil, fmt.Errorf("missing 'path' for file source")
-		}
-		return &FileLogSource{Path: path}, nil
-	case "api":
-		url := r.URL.Query().Get("url")
-		if url == "" {
-			return nil, fmt.Errorf("missing 'url' for api source")
-		}
-		return &APILogSource{
-			URL: url,
-			Client: &http.Client{
-				Timeout: 10 * time.Second,
-			},
-		}, nil
-	default:
-		return nil, fmt.Errorf("invalid or missing 'source' (expected 'file' or 'api')")
-	}
-}
-
-func sourceFromConfig(appName, logKey string) (LogSource, error) {
-	if globalConfig == nil {
-		return nil, fmt.Errorf("config not loaded; start server with -config flag")
-	}
-
-	appCfg, ok := globalConfig.Apps[appName]
+func sourceFromConfig(app, key string) (LogSource, LogTarget, error) {
+	a, ok := globalConfig.Apps[app]
 	if !ok {
-		return nil, fmt.Errorf("unknown app %q", appName)
+		return nil, LogTarget{}, fmt.Errorf("unknown app")
 	}
-
-	target, ok := appCfg.Logs[logKey]
+	t, ok := a.Logs[key]
 	if !ok {
-		return nil, fmt.Errorf("unknown log key %q for app %q", logKey, appName)
+		return nil, LogTarget{}, fmt.Errorf("unknown log key")
 	}
 
-	switch target.Type {
-	case "file":
-		if target.Path == "" {
-			return nil, fmt.Errorf("log %q for app %q: missing path", logKey, appName)
+	if t.Type == "file" {
+		return &FileLogSource{Path: t.Path}, t, nil
+	}
+	return &APILogSource{URL: t.URL}, t, nil
+}
+
+//
+// ================= LOG PARSER =================
+//
+
+var timeRegex = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}`)
+
+func parseLine(line, service string) LogOutput {
+	level := "INFO"
+	for _, l := range []string{"ERROR", "WARN", "DEBUG"} {
+		if strings.Contains(line, l) {
+			level = l
+			break
 		}
-		return &FileLogSource{Path: target.Path}, nil
-	case "api":
-		if target.URL == "" {
-			return nil, fmt.Errorf("log %q for app %q: missing url", logKey, appName)
-		}
-		return &APILogSource{
-			URL: target.URL,
-			Client: &http.Client{
-				Timeout: 10 * time.Second,
-			},
-		}, nil
-	default:
-		return nil, fmt.Errorf("log %q for app %q: invalid type %q (expected file or api)", logKey, appName, target.Type)
+	}
+
+	msg := strings.TrimSpace(timeRegex.ReplaceAllString(line, ""))
+
+	return LogOutput{
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Level:     level,
+		Service:   service,
+		Message:   msg,
 	}
 }
 
-// ===================== HUMAN-READABLE LOG PARSING =====================
-
-func sanitizeBinary(data []byte) string {
-	cleaned := make([]rune, 0, len(data))
-	for _, b := range data {
-		if b >= 32 && b <= 126 {
-			cleaned = append(cleaned, rune(b))
-		} else if b == '\n' || b == '\r' || b == '\t' {
-			cleaned = append(cleaned, rune(b))
-		}
-	}
-	return string(cleaned)
-}
-
-var (
-	timeRegex     = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}`)
-	javaStackLine = regexp.MustCompile(`^\s*at\s+[\w.$_]+\(.*:\d+\)$`)
-)
-
-func formatLogLine(line string) map[string]interface{} {
-	result := map[string]interface{}{
-		"raw": line,
-	}
-
-	if timeRegex.MatchString(line) {
-		result["type"] = "timestamped"
-	}
-
-	if javaStackLine.MatchString(line) {
-		result["type"] = "stacktrace_line"
-	}
-
-	switch {
-	case strings.Contains(line, "ERROR"):
-		result["severity"] = "ERROR"
-	case strings.Contains(line, "WARN"):
-		result["severity"] = "WARN"
-	case strings.Contains(line, "INFO"):
-		result["severity"] = "INFO"
-	case strings.Contains(line, "DEBUG"):
-		result["severity"] = "DEBUG"
-	}
-
-	return result
-}
-
-// ===================== HTTP HANDLERS =====================
+//
+// ================= EXISTING HANDLERS =================
+//
 
 func logsHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	q := r.URL.Query()
+	app := r.URL.Query().Get("app")
+	key := r.URL.Query().Get("log")
 
-	appName := q.Get("app")
-	logKey := q.Get("log")
-
-	var (
-		sourceImpl LogSource
-		err        error
-	)
-
-	switch {
-	case appName != "" && logKey != "":
-		sourceImpl, err = sourceFromConfig(appName, logKey)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-	case q.Get("source") != "":
-		sourceImpl, err = selectSourceFromQuery(r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-	default:
-		http.Error(w, "must provide either app+log or source", http.StatusBadRequest)
-		return
-	}
-
-	lines := parseLines(r)
-	rawLogs, err := sourceImpl.ReadLogs(ctx, lines)
+	src, target, err := sourceFromConfig(app, key)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to read logs: %v", err), http.StatusInternalServerError)
+		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	clean := sanitizeBinary([]byte(rawLogs))
+	raw, _ := src.ReadLogs(r.Context(), parseLines(r))
+	sc := bufio.NewScanner(strings.NewReader(raw))
 
-	var parsed interface{}
-	if json.Unmarshal([]byte(clean), &parsed) == nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(parsed)
-		return
-	}
-
-	scanner := bufio.NewScanner(strings.NewReader(clean))
-	var output []map[string]interface{}
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	var out []LogOutput
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line != "" {
+			out = append(out, parseLine(line, target.Service))
 		}
-		formatted := formatLogLine(line)
-		output = append(output, formatted)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(output)
+	json.NewEncoder(w).Encode(out)
 }
 
-// ===================== /logs/analyze =====================
-type AnalyzeRequest struct {
-	OpenAIAPIKey string                   `json:"openai_api_key"`
-	Logs         []map[string]interface{} `json:"logs"`
-}
-
-func logsAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req AnalyzeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Example: ignore OpenAI key, just return sample recommendations
-	sampleResponse := map[string]interface{}{
+func analyzeHandler(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"recommendations": []map[string]string{
-			{
-				"title":       "Check DEBUG logs",
-				"description": fmt.Sprintf("You sent %d log entries. Review DEBUG logs for unnecessary output.", len(req.Logs)),
-				"severity":    "LOW",
-			},
-			{
-				"title":       "Review HikariPool stats",
-				"description": "Pool cleanup messages detected frequently; ensure proper connection management.",
-				"severity":    "MEDIUM",
-			},
+			{"title": "Reduce DEBUG logs", "severity": "LOW"},
 		},
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(sampleResponse)
-}
-
-// ===================== /logs/apply-patch =====================
-type ApplyPatchRequest struct {
-	Recommendations []map[string]string `json:"recommendations"`
+	})
 }
 
 func applyPatchHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+}
+
+//
+// ================= ROTATION-SAFE TAIL =================
+//
+
+func tailFile(ctx context.Context, path, service string, onLog func(map[string]interface{})) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var lastSize int64
+	file.Seek(0, io.SeekEnd)
+	reader := bufio.NewReader(file)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			info, err := file.Stat()
+			if err == nil && info.Size() < lastSize {
+				file.Close()
+				file, _ = os.Open(path)
+				reader = bufio.NewReader(file)
+				lastSize = 0
+			}
+
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					time.Sleep(time.Second)
+					continue
+				}
+				return err
+			}
+
+			lastSize += int64(len(line))
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+
+			log := parseLine(line, service)
+			onLog(map[string]interface{}{
+				"timestamp": log.Timestamp,
+				"level":     log.Level,
+				"service":   log.Service,
+				"message":   log.Message,
+			})
+		}
+	}
+}
+
+//
+// ================= STREAM HANDLERS =================
+//
+
+func streamIngestHandler(w http.ResponseWriter, r *http.Request) {
+	app := r.URL.Query().Get("app_name")
+	logType := r.URL.Query().Get("log_type")
+
+	if app == "" || logType == "" {
+		http.Error(w, "app_name and log_type required", 400)
 		return
 	}
 
-	var req ApplyPatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+	src, target, err := sourceFromConfig(app, logType)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	// Simulate checking if files are remote
-	remote := true // change to false to simulate local files
+	fileSrc, ok := src.(*FileLogSource)
+	if !ok {
+		http.Error(w, "only file logs supported", 400)
+		return
+	}
 
-	var resp map[string]string
-	if remote {
-		resp = map[string]string{
-			"status":  "success",
-			"message": "Applied recommendations to remote files",
+	currentStream.Active = true
+	currentStream.AppName = app
+	currentStream.LogType = logType
+	currentStream.Path = fileSrc.Path
+	currentStream.StartedAt = time.Now()
+
+	lines := parseLines(r)
+	raw, _ := fileSrc.ReadLogs(r.Context(), lines)
+	sc := bufio.NewScanner(strings.NewReader(raw))
+
+	accepted := 0
+
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
 		}
-	} else {
-		resp = map[string]string{
-			"status":  "skipped",
-			"message": "Files are local; no changes applied",
+		log := parseLine(line, target.Service)
+		if streamMgr.Ingest(map[string]interface{}{
+			"timestamp": log.Timestamp,
+			"level":     log.Level,
+			"service":   log.Service,
+			"message":   log.Message,
+		}) {
+			accepted++
 		}
+	}
+
+	go tailFile(r.Context(), fileSrc.Path, target.Service, func(m map[string]interface{}) {
+		if streamMgr.Ingest(m) {
+			accepted++
+		}
+	})
+
+	var bundle *CorrelationBundle
+	flushed := false
+	if streamMgr.ShouldFlush() {
+		bundle = streamMgr.Flush()
+		flushed = bundle != nil
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"accepted": accepted,
+		"flushed":  flushed,
+		"bundle":   bundle,
+	})
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok"}`))
+func streamStatusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(currentStream)
 }
 
-// ===================== MAIN =====================
+func streamLiveHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "stream unsupported", 500)
+		return
+	}
+
+	ch := streamMgr.Subscribe()
+	defer streamMgr.Unsubscribe(ch)
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case bundle := <-ch:
+			b, _ := json.Marshal(bundle)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+		}
+	}
+}
+
+func preprocessHandler(w http.ResponseWriter, r *http.Request) {
+	// Read JSON body
+	var rawData []map[string]interface{}
+	err := json.NewDecoder(r.Body).Decode(&rawData)
+	if err != nil {
+		http.Error(w, "invalid JSON body", 400)
+		return
+	}
+
+	processor := NewLogPreprocessorFullGo()
+	bundle, err := processor.Process(rawData)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(bundle)
+}
+
+//
+// ================= MAIN =================
+//
 
 func main() {
-	addrFlag := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
-	configPath := flag.String("config", "", "path to YAML config file")
+	addr := flag.String("addr", "127.0.0.1:8080", "")
+	cfg := flag.String("config", "", "")
 	flag.Parse()
 
-	if *configPath != "" {
-		cfg, err := loadConfig(*configPath)
-		if err != nil {
-			fmt.Printf("failed to load config: %v\n", err)
-			os.Exit(1)
-		}
-		globalConfig = cfg
-		fmt.Println("config loaded from", *configPath)
+	if *cfg != "" {
+		b, _ := os.ReadFile(*cfg)
+		yaml.Unmarshal(b, &globalConfig)
 	}
 
-	addr := *addrFlag
-	if globalConfig != nil && globalConfig.Server != nil && globalConfig.Server.Addr != "" && *addrFlag == ":8080" {
-		addr = globalConfig.Server.Addr
+	if globalConfig.Server == nil {
+		globalConfig.Server = &ServerConfig{DefaultLines: 100, MaxLines: 1000}
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/logs", logsHandler)
-	mux.HandleFunc("/logs/analyze", logsAnalyzeHandler)
-	mux.HandleFunc("/logs/apply-patch", applyPatchHandler)
-	mux.HandleFunc("/health", healthHandler)
+	http.HandleFunc("/logs", logsHandler)
+	http.HandleFunc("/logs/analyze", analyzeHandler)
+	http.HandleFunc("/logs/apply-patch", applyPatchHandler)
 
-	fmt.Printf("Starting log agent on %s\n", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		fmt.Printf("server error: %v\n", err)
-	}
+	http.HandleFunc("/stream/ingest", streamIngestHandler)
+	http.HandleFunc("/stream/status", streamStatusHandler)
+	http.HandleFunc("/stream/live", streamLiveHandler)
+	http.HandleFunc("/logs/preprocess", preprocessHandler)
+
+	fmt.Println("Agent running on", *addr)
+	http.ListenAndServe(*addr, nil)
 }
