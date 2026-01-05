@@ -189,7 +189,7 @@ func sourceFromConfig(app, key string) (LogSource, LogTarget, error) {
 
 var springLogRegex = regexp.MustCompile(
 	`^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+` +
-		`(DEBUG|INFO|WARN|ERROR)\s+` +
+		`(TRACE|DEBUG|INFO|WARN|ERROR)\s+` +
 		`\d+\s+---\s+\[.*?\]\s+` +
 		`([^\s]+)\s*:\s*(.*)$`,
 )
@@ -198,10 +198,20 @@ func parseRawLogLine(line, severity string) map[string]interface{} {
 	m := springLogRegex.FindStringSubmatch(line)
 
 	if len(m) == 0 {
+		svc := "unknown"
+
+		// Try to extract service from last token before colon
+		if idx := strings.LastIndex(line, ":"); idx > 0 {
+			parts := strings.Fields(line[:idx])
+			if len(parts) > 0 {
+				svc = parts[len(parts)-1]
+			}
+		}
+
 		return map[string]interface{}{
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 			"level":     severity,
-			"service":   "unknown",
+			"service":   svc,
 			"message":   strings.TrimSpace(line),
 		}
 	}
@@ -387,6 +397,15 @@ type PreprocessCombinedResponse struct {
 	AnalyzeResponse    json.RawMessage `json:"analyze_response"`
 }
 
+func firstNonEmpty(list []string) string {
+    for _, v := range list {
+        if v != "" {
+            return v
+        }
+    }
+    return ""
+}
+
 //
 // ================= PREPROCESS HANDLER (FIXED DYNAMICALLY) =================
 //
@@ -434,8 +453,21 @@ func preprocessHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(rawData) == 0 {
-		http.Error(w, "no logs found in payload", 400)
-		return
+		if bundle, ok := payload["bundle"].(map[string]interface{}); ok {
+			if patterns, ok := bundle["logPatterns"].([]interface{}); ok {
+				for _, p := range patterns {
+					if pm, ok := p.(map[string]interface{}); ok {
+						rawData = append(rawData, map[string]interface{}{
+							"timestamp": pm["firstOccurrence"],
+							"level":     "ERROR",
+							"service":   "unknown",
+							"message":   pm["pattern"],
+							"errorClass": pm["errorClass"],
+						})
+					}
+				}
+			}
+		}
 	}
 
 	processor := NewLogPreprocessorFullGo()
@@ -459,12 +491,25 @@ func preprocessHandler(w http.ResponseWriter, r *http.Request) {
 	// Convert bundle.Events ([]string) to []AnalyzeEvent
 	var events []AnalyzeEvent
 	if bundle.Events != nil {
-		for _, e := range bundle.Events {
-			events = append(events, AnalyzeEvent{Reason: e})
+		for i, e := range bundle.Events {
+			events = append(events, AnalyzeEvent{
+				ID:        fmt.Sprintf("evt_%d", i+1),
+				Type:      "observation",
+				Reason:    e,
+				Service:   firstNonEmpty(bundle.AffectedServices),
+				Timestamp: bundle.WindowStart,
+			})
 		}
 	} else {
 		events = []AnalyzeEvent{}
 	}
+
+	rootSvc := ""
+	if bundle.RootService != nil {
+		rootSvc = *bundle.RootService
+	}
+
+
 
 	// -------- EXISTING PREPROCESS RESPONSE (UNCHANGED) --------
 	preprocessResponse := AnalyzeResponse{
@@ -472,11 +517,12 @@ func preprocessHandler(w http.ResponseWriter, r *http.Request) {
 			ID:                   bundle.ID,
 			WindowStart:          bundle.WindowStart,
 			WindowEnd:            bundle.WindowEnd,
-			RootService:          "",
+			RootService:          rootSvc,
 			AffectedServices:     bundle.AffectedServices,
 			LogPatterns:          patterns,
 			Events:               events,
 			Metrics: AnalyzeMetrics{
+				CPUZ:       bundle.Metrics.CPUZ,
 				LatencyZ:   bundle.Metrics.LatencyZ,
 				ErrorRateZ: bundle.Metrics.ErrorRateZ,
 			},
