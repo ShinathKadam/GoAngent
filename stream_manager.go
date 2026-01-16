@@ -72,7 +72,7 @@ type StreamConfig struct {
 func DefaultStreamConfig() StreamConfig {
 	return StreamConfig{
 		MaxLogsPerSecond:     50,
-		MaxBufferSize:        200,
+		MaxBufferSize:        50,
 		MaxTokensPerRun:      6000,
 		MaxStreamDurationMin: 60,
 		MinStreamDurationMin: 15,
@@ -176,6 +176,10 @@ func (s *StreamManager) Flush() *CorrelationBundle {
 	bundle := s.Preprocessor.Factory.CreateBundle(s.Buffer, patterns)
 
 	estimatedTokens := s.estimateTokens(bundle)
+
+	bundle.Metadata["original_token_est"] = estimatedTokens
+	bundle.Metadata["truncated"] = false
+
 	if estimatedTokens > s.Config.MaxTokensPerRun {
 		ratio := float64(s.Config.MaxTokensPerRun) / float64(estimatedTokens)
 		newLen := int(float64(len(bundle.Sequence)) * ratio * 0.9)
@@ -183,7 +187,7 @@ func (s *StreamManager) Flush() *CorrelationBundle {
 			newLen = 0
 		}
 		bundle.Sequence = bundle.Sequence[:newLen]
-		bundle.Metadata["truncated"] = true
+		// bundle.Metadata["truncated"] = true
 		bundle.Metadata["original_token_est"] = estimatedTokens
 	}
 
