@@ -422,8 +422,14 @@ func detectDefaultBranch(workspace string) string {
 	return "master"
 }
 
-func hasPushAccess(workspace string) bool {
-	_, err := runGitOutput(workspace, "git", "push", "--dry-run")
+func hasUpstream(workspace string) bool {
+	_, err := runGitOutput(workspace, "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	return err == nil
+}
+
+func hasGitHubAuth(workspace string) bool {
+	// This checks if GitHub can be accessed with current credentials
+	_, err := runGitOutput(workspace, "git", "ls-remote", "origin")
 	return err == nil
 }
 
@@ -432,20 +438,50 @@ func runFixWorkflow(cmds []string, workspace string, dry bool) {
 	broadcastFix("INFO: detected default branch → " + branch)
 
 	for i, c := range cmds {
+
 		c = strings.ReplaceAll(c, "git checkout master", "git checkout "+branch)
 		c = strings.ReplaceAll(c, "git pull origin master", "git pull origin "+branch)
 		c = strings.ReplaceAll(c, "git push origin master", "git push origin "+branch)
 		c = strings.ReplaceAll(c, "git checkout main", "git checkout "+branch)
 		c = strings.ReplaceAll(c, "git pull origin main", "git pull origin "+branch)
 		c = strings.ReplaceAll(c, "git push origin main", "git push origin "+branch)
+
+		// ✅ BRANCH SAFE HANDLING
+		if strings.HasPrefix(strings.TrimSpace(c), "git checkout ") {
+			parts := strings.Fields(c)
+			if len(parts) == 3 && parts[1] == "checkout" {
+				br := parts[2]
+
+				if branchExists(workspace, br) {
+					c = "git checkout " + br
+				} else {
+					c = "git checkout -b " + br
+				}
+			}
+		}
+
 		cmds[i] = c
 	}
 
-	// safety: check push permission once
-	if !dry && !hasPushAccess(workspace) {
-		broadcastFix("ERROR: No push permission for this repository. Aborting.")
-		broadcastFix("__CLOSE__")
-		return
+	// safety: git environment checks
+	if !dry {
+
+		if !hasGitHubAuth(workspace) {
+			broadcastFix("ERROR: GitHub authentication failed. Please login (git push once manually).")
+			broadcastFix("__CLOSE__")
+			return
+		}
+
+		if !hasUpstream(workspace) {
+			broadcastFix("INFO: No upstream branch found. Setting upstream to origin/" + branch)
+
+			_, err := runGitOutput(workspace, "git", "branch", "--set-upstream-to=origin/"+branch)
+			if err != nil {
+				broadcastFix("ERROR: Failed to set upstream branch.")
+				broadcastFix("__CLOSE__")
+				return
+			}
+		}
 	}
 
 	if !filepath.IsAbs(workspace) {
@@ -672,6 +708,7 @@ type AnalyzeBundle struct {
 	Metrics              AnalyzeMetrics      `json:"metrics"`
 	DependencyGraph      []string            `json:"dependencyGraph"`
 	DerivedRootCauseHint string              `json:"derivedRootCauseHint"`
+	GitConfig            interface{}         `json:"git_config,omitempty"`
 }
 
 type AnalyzeLogPattern struct {
@@ -737,6 +774,15 @@ func preprocessHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body", 400)
 		return
 	}
+
+	var gitConfig interface{}
+
+	if bundle, ok := payload["bundle"].(map[string]interface{}); ok {
+		if gc, ok := bundle["git_config"]; ok {
+			gitConfig = gc
+		}
+	}
+
 
 	var rawData []map[string]interface{}
 	inputBundleID := ""
@@ -832,6 +878,8 @@ func preprocessHandler(w http.ResponseWriter, r *http.Request) {
 			},
 			DependencyGraph:      bundle.DependencyGraph,
 			DerivedRootCauseHint: bundle.DerivedRootCauseHint,
+			GitConfig:            gitConfig,
+
 		},
 		UseRag: true,
 		TopK:   5,
@@ -937,6 +985,11 @@ func writeAgentPort(port string) {
 	// extension reads: server/agent.port
 	p := filepath.Join(base, "agent.port")
 	_ = os.WriteFile(p, []byte(port), 0644)
+}
+
+func branchExists(workspace, name string) bool {
+	_, err := runGitOutput(workspace, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+name)
+	return err == nil
 }
 
 //
