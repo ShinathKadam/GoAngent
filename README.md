@@ -1,208 +1,338 @@
-# 🧠 Log Recommendation Go Agent
-## 📌 Description
+## 🧠 Opscure Log Recommendation Go Agent
 
-This project acts as an intermediary service that fetches logs based on the file name specified in the configuration file. It sends the collected logs to a recommendation engine for analysis and attempts to automatically fix issues when the log file is located on a remote server.
+A high-performance Go service that runs as a sidecar agent for the Opscure VS Code extension.
+It continuously ingests logs, builds intelligent correlation bundles, sends them to an AI analysis service, and ***can apply automated fixes*** on the user’s codebase with live execution streaming and rollback support.
 
 ---
 
-## ✨ Features
+## 📌 What this agent does
 
-### 🔄 Supports multiple applications
+- Acts as a local runtime companion (sidecar) to the VS Code extension
 
-### 📂 Fetches logs from:
+- Ingests logs from applications in real time
 
-Local or remote files
+- Builds structured log bundles (windowed, severity-aware, service-aware)
 
-HTTP API endpoints
+- Calls AI analyze service to generate root cause + recommendations
 
-### 🤖 Sends logs for AI-based analysis and recommendations
+- Applies AI-generated fixes safely using git workflows
 
-### 🛠️ Attempts auto-fix for remote log sources (if supported)
+- Streams fix execution logs back to the extension UI
 
-### ⚙️ Config-driven and easily extensible
+- Supports automatic rollback if a fix fails
+
+---
+
+## ✨ Core Features
+
+- 🔄 Continuous log ingestion & batching
+
+- 📦 Intelligent bundle creation (patterns, services, metrics)
+
+- 🤖 AI preprocessing + analyze pipeline
+
+- 🛠️ Automated fix execution (git, sed, docker, kubectl, etc.)
+
+- 📡 Live SSE streams for:
+
+  - Log bundles
+
+  - Fix execution output
+
+- 🔁 Auto-rollback support
+
+- 🔌 Auto-port binding + extension discovery
+
+- ⚙️ Config-driven log sources
+
+---
+
+## 🧩 How it runs (Sidecar Mode)
+
+When started, the agent:
+
+1. Binds to 127.0.0.1:8080 (or auto-selects a free port if busy)
+
+2. Writes the selected port into a local file called:
+
+```
+agent.port
+```
+
+3. The VS Code extension reads this file to discover the running agent.
+
+This allows the agent to run **automatically alongside the extension without manual port configuration**.
 
 ---
 
 ## 🧰 Prerequisites
 
-Before running this agent, install the following software.
+Install the following before running the agent.
 
-### 🟦 1. Go (Golang)
+#### 🟦 1. Go (Required)
 
-**Version:** Go 1.20 or later
+Version: Go 1.20+
 
-**🔗 Download:** https://go.dev/dl/
+Download:
+https://go.dev/dl/
 
-Verify installation:
+Verify:
 
-```bash
+```go
 go version
 ```
 
 ---
 
-## 🧩 2. Git
+#### 🧩 2. Git (Required – for auto-fix system)
 
-***🔗 Download:** https://git-scm.com/downloads
+Download:
+https://git-scm.com/downloads
 
-Verify installation:
+Verify:
 
-```bash
+```css
 git --version
 ```
 
+
+Git is mandatory because the agent:
+
+Detects default branch
+
+- Runs checkout / pull / push
+
+- Applies fixes
+
+- Performs rollback
+
 ---
 
-## 🟢 3. Node.js (Optional)
+#### 🟢 3. Node.js (Optional – Extension side)
 
-Required only if the agent is integrated with a VS Code extension or AI service.
+Required only if running the VS Code extension.
 
-**Version:** Node.js 18 or later
+Version: Node.js 18+
 
-**🔗 Download:** https://nodejs.org/
+Verify:
 
-Verify installation:
-
-```bash
+```nginx
 node -v
 npm -v
 ```
 
 ---
 
-## 🗂️ Project Structure
-```lua
+## Project Structure
+
+```
 .
-├── main.go
+├── main.go                  # HTTP server, APIs, sidecar logic
+├── stream_manager.go        # Streaming, buffering, bundling
+├── log_preprocessor.go      # Pattern mining & correlation logic
 ├── go.mod
 ├── go.sum
-├── config.yaml            # Local config (do not commit if it contains secrets)
-├── config.example.yaml    # Sample config for reference
+├── config.yaml              # Local config (DO NOT COMMIT)
+├── config.example.yaml      # Sample config
 └── .gitignore
 ```
 
 ---
 
 ## ⚙️ Configuration
-## 📄 Configuration File (config.yaml)
 
-The agent reads log sources from config.yaml.
-You can define multiple applications, and each application can have multiple log sources.
+The agent supports optional static log sources via config.yaml.
 
-### 🧪 Sample config.yaml
+Example:
+
 ```yaml
+server:
+  default_lines: 100
+  max_lines: 1000
+
 apps:
   banking:
     logs:
       app:
         type: file
         path: E:/replit_prj/banking/logs.log
-
-      app-log:
-        type: file
-        path: E:/replit_prj/banking/app.log
+        service: FileService
 
       api-errors:
         type: api
-        url: https://logs.internal/payments/errors
+        url: https://internal/api/logs
+        service: PaymentAPI
+```
+
+Supported types
+
+- file → local log files
+
+- api → HTTP log endpoint
+
+---
+
+## 🚀 Running the agent
+**▶️ Run locally (development mode)**
+
+From the project root:
+
+```arduino
+go run .
+```
+
+
+or with config:
+
+```arduino
+go run . -config="E:\replit_prj\log-agent\config.yaml"
+```
+
+Linux / macOS:
+
+```arduino
+go run . -config="/home/user/log-agent/config.yaml"
+```
+
+On startup you will see:
+
+```csharp
+[OPSCURE] Agent running on 127.0.0.1:PORT
+```
+
+The selected port is written to:
+
+```
+agent.port
 ```
 
 ---
 
-## 🔍 Configuration Explanation
+## 🔌 HTTP APIs
+**Log ingestion**
 
-**apps →** Root section containing all applications
-
-**banking →** Application name (can be any identifier)
-
-**logs →** All log sources for the application
-
-**type**
-
-📄 file → Reads logs from a file
-
-🌐 api → Fetches logs from an HTTP endpoint
-
-**path →** Absolute file path (for file type)
-
-**url →** API endpoint (for api type)
-
----
-
-## 🚀 Setup Instructions
-### 📥 Clone the Repository
 ```bash
-git clone <your-repository-url>
-cd <your-project-folder>
+POST /stream/ingest
 ```
 
----
-
-## 📝 Create Configuration File
-
-Create a local config.yaml file and update values as required.
-
-⚠️ Do not commit config.yaml if it contains secrets or credentials.
-✅ Use config.example.yaml for version control.
+Used by applications / extension to push logs.
 
 ---
 
-## ▶️ Run the Go Agent
-### 💻 Command
+## Live bundle stream (SSE)
+
 ```bash
-go run main.go -config="your_file_path\config.yaml"
+GET /stream/live
 ```
 
-### 🪟 Example (Windows)
-```bash
-go run main.go -config="E:\replit_prj\log-agent\config.yaml"
-```
-
-### 🐧 Example (Linux / macOS)
-```bash
-go run main.go -config="/home/user/log-agent/config.yaml"
-```
+Extension subscribes here to receive correlation bundles.
 
 ---
 
-## 🔄 How It Works
+## Preprocess + AI analyze
 
-📥 Loads application and log source details from config.yaml
+```bash
+POST /logs/preprocess
+```
 
-📊 Fetches logs from file paths or API endpoints
+- Builds correlation bundle
 
-🤖 Sends logs to the recommendation engine for analysis
+- Injects git config (if present)
 
-📬 Receives recommendations or fixes
+- Calls AI analyze service
 
-🛠️ Attempts to auto-fix issues when logs are from remote sources
+- Returns combined response
 
 ---
+
+## Apply AI fix
+
+```bash
+POST /fix/apply
+```
+
+- Validates AI recommendation
+
+- Executes commands
+
+- Streams output
+
+- Supports dry-run mode
+
+---
+
+## Fix execution stream
+
+```bash
+GET /fix/stream
+```
+
+Live execution logs (SSE).
+
+---
+
+## Rollback
+
+```bash
+POST /fix/rollback
+```
+
+Replays last stored rollback commands.
+
+---
+
+## 🔄 Internal Flow
+
+```bash
+Application / Extension
+        ↓
+/stream/ingest
+        ↓
+Stream Manager
+        ↓
+Bundle Flush
+        ↓
+/logs/preprocess
+        ↓
+AI Analyze Service
+        ↓
+Recommendations
+        ↓
+/fix/apply → /fix/stream
+        ↓
+Git workflow + live output
+```
 
 ## ✅ Best Practices
 
-🔐 Keep secrets out of Git
+- Do not commit config.yaml
 
-📍 Use absolute paths for log files
+- Always use absolute paths
 
-🌐 Validate API endpoints before running the agent
+- Ensure GitHub authentication is working before applying fixes
 
-📄 Commit only config.example.yaml
+- Keep the agent running as a background sidecar for the extension
+
+- Review AI fixes before disabling dry-run
 
 ---
 
-## 🔮 Future Enhancements
+## 🔮 Roadmap Ideas
 
-🔑 Authentication support for API-based logs
+- Dockerized agent
 
-⏱️ Configurable polling intervals
+- Secure auth between extension & agent
 
-🐳 Docker support
+- Pluggable log adapters
 
-📊 Web dashboard for insights
+- Policy-based fix restrictions
+
+- Visual metrics dashboard
 
 ---
 
 ## 📜 License
 
-This project is licensed under the MIT License.
+MIT License
+
+---
